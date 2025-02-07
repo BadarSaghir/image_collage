@@ -1,9 +1,12 @@
 use clap::Parser;
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
+use image::{DynamicImage, GenericImageView, ImageBuffer, Rgba};
+use memmap2::MmapMut;
 use std::cmp;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use tempfile::tempfile;
 
 /// Create a collage from images in sorted subfolders.
 #[derive(Parser, Debug)]
@@ -20,8 +23,9 @@ struct Args {
     cell_size: u32,
 }
 
+/// Recursively gathers image paths from subfolders (sorted by folder and filename).
 fn get_sorted_image_paths(root_dir: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
-    // List subdirectories in the root directory (sorted).
+    // List subdirectories (folders) in the root directory.
     let mut subfolders = fs::read_dir(root_dir)
         .expect("Unable to read input directory")
         .filter_map(|entry| {
@@ -35,6 +39,7 @@ fn get_sorted_image_paths(root_dir: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
         .collect::<Vec<_>>();
     subfolders.sort();
 
+    // For each folder, collect image paths with .webp, .jpg, or .jpeg extension.
     let mut image_paths = Vec::new();
     for folder in &subfolders {
         let mut imgs_in_folder = fs::read_dir(folder)
@@ -64,52 +69,94 @@ fn get_sorted_image_paths(root_dir: &str) -> (Vec<PathBuf>, Vec<PathBuf>) {
     (image_paths, subfolders)
 }
 
+/// Creates the collage using a disk‑backed memory map to reduce in‑memory usage.
 fn create_collage(image_paths: &[PathBuf], cell_size: u32, output_path: &str) -> image::ImageResult<()> {
     let total_images = image_paths.len() as u32;
     if total_images == 0 {
         eprintln!("No images found!");
         return Ok(());
     }
-    // Calculate grid dimensions.
+    // Calculate grid dimensions (nearly square).
     let ncols = (total_images as f64).sqrt().ceil() as u32;
     let nrows = (total_images + ncols - 1) / ncols; // ceiling division
     let collage_width = ncols * cell_size;
     let collage_height = nrows * cell_size;
+    let num_pixels = (collage_width * collage_height) as usize;
+    let buffer_size = num_pixels * 4; // 4 channels per pixel (RGBA)
 
-    // Create a new image with transparent background.
-    let mut collage: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_pixel(collage_width, collage_height, Rgba([0, 0, 0, 0]));
+    // Create a temporary file to back our memmap.
+    let mut file = tempfile().expect("failed to create temp file");
+    file.set_len(buffer_size as u64)
+        .expect("failed to set file length");
 
+    // Memory-map the file.
+    let mut mmap = unsafe { MmapMut::map_mut(&file).expect("failed to map file") };
+
+    // Initialize the memory to a “transparent white” background:
+    // Set R, G, B to 255 and Alpha to 0 for every pixel.
+    for i in 0..num_pixels {
+        let offset = i * 4;
+        mmap[offset] = 255;     // R
+        mmap[offset + 1] = 255; // G
+        mmap[offset + 2] = 255; // B
+        mmap[offset + 3] = 0;   // A
+    }
+
+    // Process each image and paste it into its cell in the collage.
     for (idx, img_path) in image_paths.iter().enumerate() {
-        let img = image::open(img_path).unwrap_or_else(|e| {
-            eprintln!("Error processing {:?}: {}", img_path, e);
-            // Return an empty image if error occurs.
-            DynamicImage::new_rgba8(1, 1)
-        });
+        // Attempt to open the image; if it fails, skip it.
+        let img = match image::open(img_path) {
+            Ok(im) => im,
+            Err(e) => {
+                eprintln!("Error processing {:?}: {}", img_path, e);
+                // Use a 1x1 empty image as fallback.
+                DynamicImage::new_rgba8(1, 1)
+            }
+        };
+
         let (orig_w, orig_h) = img.dimensions();
-        // Compute scale factor so that the longer side equals cell_size.
+        // Compute scale factor so that the longer side equals the cell size.
         let scale_factor = cell_size as f32 / (cmp::max(orig_w, orig_h) as f32);
         let new_w = (orig_w as f32 * scale_factor).round() as u32;
         let new_h = (orig_h as f32 * scale_factor).round() as u32;
-        // Resize the image using a high-quality filter.
-        let resized = img.resize(new_w, new_h, FilterType::Lanczos3);
+        let resized = img.resize(new_w, new_h, FilterType::Lanczos3).to_rgba8();
 
-        // Determine the cell position.
+        // Determine which cell (column, row) the image should go in.
         let col = (idx as u32) % ncols;
         let row = (idx as u32) / ncols;
         let cell_x = col * cell_size;
         let cell_y = row * cell_size;
-        // Center the resized image in the cell.
+        // Center the resized image within its cell.
         let offset_x = cell_x + (cell_size - new_w) / 2;
         let offset_y = cell_y + (cell_size - new_h) / 2;
 
-        // Paste the resized image onto the collage.
-        collage.copy_from(&resized.to_rgba8(), offset_x, offset_y).unwrap();
+        // Copy pixels from the resized image into the correct region of the memmap.
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let pixel = resized.get_pixel(x, y);
+                let target_x = offset_x + x;
+                let target_y = offset_y + y;
+                if target_x < collage_width && target_y < collage_height {
+                    let index = ((target_y * collage_width + target_x) * 4) as usize;
+                    mmap[index] = pixel[0];
+                    mmap[index + 1] = pixel[1];
+                    mmap[index + 2] = pixel[2];
+                    mmap[index + 3] = pixel[3];
+                }
+            }
+        }
     }
+    mmap.flush().expect("failed to flush mmap");
+
+    // At this point, the memmap contains the full collage.
+    // Convert the memory-mapped data into a Vec<u8>.
+    // (The final conversion requires an owned buffer.)
+    let data = mmap.to_vec();
+    let collage_buffer = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(collage_width, collage_height, data)
+        .expect("Failed to create ImageBuffer");
 
     // Save the final collage in WebP format.
-    // The image crate supports saving in WebP if the format is detected from the extension.
-    collage.save_with_format(output_path, image::ImageFormat::WebP)?;
+    collage_buffer.save_with_format(output_path, image::ImageFormat::WebP)?;
     println!("Collage saved to '{}'", output_path);
     Ok(())
 }
